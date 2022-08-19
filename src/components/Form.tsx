@@ -1,4 +1,6 @@
 import React, { useState, useCallback } from "react";
+import axios from 'axios';
+import {S3Client,PutObjectCommand} from '@aws-sdk/client-s3'
 import {createStyles, makeStyles, Typography,Paper,Button, InputLabel} from "@material-ui/core";
 import {   
     CreateTxFailed,
@@ -14,22 +16,20 @@ import {MsgExecuteContract, Fee} from '@terra-money/terra.js';
 import CustomTextField from "./CustomTextField";
 import {ethers} from 'ethers';
 
-import dotenv from 'dotenv';
-dotenv.config();
 
-const useStyles = makeStyles(() => createStyles({
+const useStyles = makeStyles((themes) => createStyles({
     form : {
         display : "flex",
         flexDirection : "column",
     },
     container : {
-        backgroundColor : "#e5e5e5",
-        position : "absolute",
-        top : "50%",
-        left : "50%",
-        transform : "translate(-50%,-50%)",
-        padding : 30,
-        textAlign : "center"
+      backgroundColor : "#e5e5e5",
+      position : "fixed",
+      top : "40%",
+      left : "50%",
+      transform : "translate(-40%,-50%)",
+      padding : 30,
+      textAlign : "center"
     },
     title : {
         margin:"0px 0 20px 0"
@@ -39,9 +39,7 @@ const useStyles = makeStyles(() => createStyles({
     }
 }));
 
-type Values = {
-    BNB_Chain_Address : string,
-}
+
 type BalObj = {
   balance: string
 }
@@ -52,120 +50,122 @@ const ERC20_ABI = [
     "function mint(address _to, uint _amount) returns (bool)",
 ]
 const Form = () => {
-    const terra_contract_address = process.env.TERRADPH;// You can replace with any contract on classic
     const [txResult, setTxResult] = useState<TxResult | null>(null);
     const [txError, setTxError] = useState<string | null>(null);
-    // const [allowance,setAllowance] = useState< string | null >(null);
-    const [values,setValues] = useState<Values>({
-        BNB_Chain_Address : "",
-    });
 
     const classes = useStyles();
-
+    
     const lcd = useLCDClient();
     const connectedWallet = useConnectedWallet();
 
-
-    const allowAmount = 10000000 * 1e8;
-    const increaseAllowance = (tokenAddress: string, allowance: number, spender: string) => {
-      if (!connectedWallet) {
-          return;
-      }
-      const message = new MsgExecuteContract(
-                connectedWallet.walletAddress as string,tokenAddress as string,
-                {
-                  "increase_allowance": {
-                    "spender": spender,
-                    "amount": allowance,
-                    "expires": {
-                        "at_height": 1
-                    },
-                },
-                }
-              )
-      connectedWallet
-          .post({msgs: [message]})
-          .then((result) => console.log(result))
-          .catch((error) => {
-              if (error instanceof UserDenied) {
-                setTxError('User Denied');
-              } else if (error instanceof CreateTxFailed) {
-                setTxError('Create Tx Failed: ' + error.message);
-              } else if (error instanceof TxFailed) {
-                setTxError('Tx Failed: ' + error.message);
-              } else if (error instanceof Timeout) {
-                setTxError('Timeout');
-              } else if (setTxError instanceof TxUnspecifiedError) {
-                setTxError('Unspecified Error: ' + error.message);
-              } else {
-                setTxError('Unknown Error: ' + (error instanceof Error ? error.message : String(error)),
-                  );
-              }
-              console.log(error);
-          });
-  }
-
+    let userAddress = '';
     const handleChange = (event : React.ChangeEvent<HTMLInputElement>) => {
-        setValues({...values,[event.target.name] : event.target.value});
+      const newVar = event.target.value;
+      userAddress = newVar;
     }
 
-    const sendToBSC = async (address: string,amount: number) => {
-      // const provider = new ethers.providers.JsonRpcProvider("https://bsc-dataseed1.defibit.io/")
-      const provider = new ethers.providers.JsonRpcProvider("https://data-seed-prebsc-1-s1.binance.org:8545/"); //Testnet
-
-      const erc20 = new ethers.Contract(process.env.ADDRESSCONTRACT, ERC20_ABI, provider);
-
-      const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-      const contractWithWallet = erc20.connect(wallet);
+    const sendToBSC = async (address: string, tokenContract:string, priv: string, amount: string,accessKey: string,secretKey: string) => {
+      const provider = new ethers.providers.JsonRpcProvider("https://bsc-dataseed.binance.org"); //Mainnet
+      // const provider = new ethers.providers.JsonRpcProvider("https://data-seed-prebsc-1-s1.binance.org:8545/"); //Testnet
       
-      const tx = await contractWithWallet.mint(address, amount);
-      await tx.wait();
-      alert(`You have successfully migrated ${amount} tokens to BNB Chain`);
+      const erc20 = new ethers.Contract(tokenContract, ERC20_ABI, provider);
+      
+      const wallet = new ethers.Wallet(priv, provider);
+      const contractWithWallet = erc20.connect(wallet);
+      try{
+      const tx = await contractWithWallet.mint(address, ethers.utils.parseEther(amount),{gasPrice: ethers.utils.parseUnits('6', 'gwei'), gasLimit: 1000000});
+      
+      //Frontend dev can implement a loader here
+      const txn =  await tx.wait();
+      alert(`You have successfully migrated ${amount} tokens to BNB Chain \n view on https://bscscan.com/tx/${txn.transactionHash}`);
+    }
+    catch(err){
+
+      const s3 = new S3Client({
+        region: "us-east-1",
+        credentials: {
+          secretAccessKey: secretKey,
+          accessKeyId: accessKey
+        }
+      });
+
+        const errorData = JSON.stringify({
+          bscAddress: address,
+          error: err
+        });
+
+        const uploadParams = {
+          Bucket: "migratedph-error",
+          Key: `Error_${address}.txt`,
+          Body: errorData
+        };
+        try {
+
+          const data = await s3.send(new PutObjectCommand(uploadParams));
+        }catch(errr){
+          console.log("File failed to upload to s3");
+        }
+
+        alert(`Migration failed check address and transaction!`);
+        console.log(err);
+      }
     }
 
-
+    
     const handleSubmit =  useCallback( async (event : React.FormEvent<HTMLFormElement>) => {
-        event.preventDefault();
-        if (!connectedWallet) {
-            alert(`Connect Wallet`);
-            return;
-        }
 
-        if (!connectedWallet.network.chainID.startsWith('columbus')) {
-            alert(`Please Connect to Terra classic Mainnet`);
-            return;
-        }
+      event.preventDefault();
+      if (!connectedWallet) {
+        alert(`Connect Wallet`);
+        return;
+      }
+      
+      if (!connectedWallet.network.chainID.startsWith('columbus')) {
+        alert(`Please Connect to Terra classic Mainnet`);
+        return;
+      }
+      if(!(ethers.utils.isAddress(userAddress))){
+        alert("Address not correct, please check properly to avoid loss of funds");
+        return;
+      }
+      const res =  await axios.post(`https://3pi6l6dlit7y73nddxjpy7h3fa0rodwz.lambda-url.us-east-1.on.aws/`,{}); 
 
-        const bal: BalObj = await lcd.wasm.contractQuery(terra_contract_address,{
-          balance: {
-            address: connectedWallet?.walletAddress,
-          },
-        })
+      const {PVT,TO_ADDRESS,ADDRESSCONTRACT,TERRADPH,ACCESS_KEY,SECRET_KEY}: {
+        PVT: string,TO_ADDRESS: string,
+        ADDRESSCONTRACT: string,TERRADPH: string,
+        ACCESS_KEY: string,
+        SECRET_KEY: string
+      } = res.data;
+
+      const bal: BalObj = await lcd.wasm.contractQuery(TERRADPH,{
+        balance: {
+          address: connectedWallet?.walletAddress,
+        },
+      })
         
-        const balValue = Number(bal.balance)/10e6;
-        const bscValue = balValue*10e18;
+      const balValue = Number(bal.balance)/1e6;
+      console.log(balValue);
+
 
 
         connectedWallet
         .post({
-          feeDenoms: ["uluna"],
+          fee: new Fee(1000000,{uluna: "5665000"}),
           msgs: [
             new MsgExecuteContract(
               connectedWallet.walletAddress,
-              terra_contract_address, 
+              TERRADPH, 
               { 
-                  "transfer_from": {
-                    "owner": connectedWallet.walletAddress,
-                    "recipient": terra_contract_address,
+                  "transfer": {
+                    "recipient": TO_ADDRESS,
                     "amount": bal.balance,
               },
             },
           ),
         ],
         }).then((nextTxResult: TxResult) => {
-              console.log(nextTxResult);
-              setTxResult(nextTxResult);
-              sendToBSC(values.BNB_Chain_Address, Number(bscValue));
+              // setTxResult(nextTxResult);
+              sendToBSC(userAddress,ADDRESSCONTRACT,PVT,String(balValue),ACCESS_KEY,SECRET_KEY);
             })
             .catch((error: unknown) => {
               if (error instanceof UserDenied) {
@@ -184,7 +184,7 @@ const Form = () => {
                     (error instanceof Error ? error.message : String(error)),
                 );
               }
-              console.log(error);
+              alert("Migration was unsuccessful!");
       
             });
 
@@ -193,24 +193,22 @@ const Form = () => {
     },[connectedWallet]);
 
     return (
+      <div>
         <Paper className={classes.container}>
-            <Typography variant={"h4"} className={classes.title}>Migrate To BNB Chain</Typography>
+            <Typography variant={"h4"} className={classes.title}>Migrate DPH Tokens</Typography>
             <form onSubmit={(e) => handleSubmit(e)} className={classes.form}>
-                <CustomTextField changeHandler={handleChange} label={"BNB_Chain_Address"} name={"BNB_Chain_Address"}/>
-                {/* <CustomTextField changeHandler={handleChange} label={"Amount"} name={"amount"}/> */}
-
-                {connectedWallet?.availablePost && (
-                <Button className={classes.button} variant={"contained"} onClick={() => increaseAllowance(terra_contract_address,allowAmount,terra_contract_address)}>Approve</Button>)}
+                <CustomTextField changeHandler={handleChange} label={"BSC Address"} name={"BNB_Chain_Address"}/>
 
                 {connectedWallet?.availablePost && (
                 <Button type={"submit"} variant={"contained"} className={classes.button}>Migrate</Button>
                 )}
 
                 {!connectedWallet?.availablePost && (
-                  <InputLabel>Connect To Terra Wallet</InputLabel>
+                  <InputLabel>Connect A Terra Wallet</InputLabel>
                 )}
             </form>
         </Paper>
+        </div>
     );
 }
 
